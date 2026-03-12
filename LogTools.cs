@@ -2,10 +2,14 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.Profiling;
 using Debug = UnityEngine.Debug;
 
 [Flags]
@@ -131,11 +135,12 @@ public static class LogTools
         return ColorUtility.ToHtmlStringRGB(color);
     }
 
+    
     [HideInCallstack]
     static void Log_Internal(string msg, Color? color = null, LogLevel logLevel = LogLevel.Info,
         UnityEngine.Object context = null, LogChannel channel = LogChannel.None)
     {
-        string prefix = channel != LogChannel.None ? $"[{channel}] " : string.Empty;
+        string prefix = channel != LogChannel.None ? $" [{channel}]  ".Colored(Color.white) : string.Empty;
 
         if (color != null)
             msg = msg.Colored(color.Value);
@@ -156,9 +161,13 @@ public static class LogTools
         }
     }
 
-    #region Serialize Object
+  #region Serialize Object 优化：反射缓存层
 
     const int MaxDepth = 10;
+    
+    // 优化：加入反射缓存，极大降低高频打印复杂对象的 CPU 开销
+    private static readonly Dictionary<Type, FieldInfo[]> FieldCache = new();
+    private static readonly Dictionary<Type, PropertyInfo[]> PropertyCache = new();
 
     static string GetIndent(int depth) => new string(' ', depth * 2);
 
@@ -269,22 +278,25 @@ public static class LogTools
             return;
         }
 
-        // 6. 类与结构体 [Obj]
-        if (type.IsClass || type.IsValueType)
+       if (type.IsClass || type.IsValueType)
         {
-            // 第一层不换行，嵌套层换行
             if (depth > 0) sb.AppendLine();
             
             sb.Append(GetIndent(depth));
-            sb.Append($"{type.Name} {{"); // 这里就不加 [Obj] 了，类名就是最好的标识
+            sb.Append($"{type.Name} {{");
             sb.AppendLine();
 
-            var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic;
-            var fields = type.GetFields(flags);
+            // 优化：从缓存读取 Fields，避免每次 GetFields 产生巨大的反射开销和 GC
+            if (!FieldCache.TryGetValue(type, out var fields))
+            {
+                var flags = BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic;
+                fields = type.GetFields(flags);
+                FieldCache[type] = fields;
+            }
             
             foreach (var field in fields)
             {
-                if (ShouldIgnoreInternal(field,field.DeclaringType)) continue;
+                if (ShouldIgnoreInternal(field, field.DeclaringType)) continue;
                 if (Attribute.IsDefined(field, typeof(CompilerGeneratedAttribute))) continue;
 
                 sb.Append(GetIndent(depth + 1));
@@ -293,10 +305,16 @@ public static class LogTools
                 sb.AppendLine(",");
             }
 
-            var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            // 优化：从缓存读取 Properties
+            if (!PropertyCache.TryGetValue(type, out var props))
+            {
+                props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                PropertyCache[type] = props;
+            }
+
             foreach (var prop in props)
             {
-                if (ShouldIgnoreInternal(prop,prop.DeclaringType)) continue;
+                if (ShouldIgnoreInternal(prop, prop.DeclaringType)) continue;
 
                 if (prop.CanRead && prop.GetIndexParameters().Length == 0)
                 {
@@ -464,95 +482,466 @@ public static class LogTools
 
     #endregion
 
-    #region Code Timer / GC Monitor
+#region Code Timer / GC Monitor (支持聚合统计)
 
+    /// <summary>
+    /// 性能监控器。
+    /// </summary>
+    /// <param name="name">监控块名称</param>
+    /// <param name="context">挂载对象</param>
+    /// <param name="channel">频道</param>
+    /// <param name="aggregateSecondsCallback">聚合打印时的回调函数</param>
+    /// <param name="aggregateSeconds">聚合打印的时间间隔(秒)。如果为 0，则立即打印；如果为 1，则每秒汇总打印一次平均/最大值。</param>
+    /// <param name="warnTimeThresholdMs">单次立即打印时的警告阈值</param>
     [HideInCallstack]
-    public static IDisposable Monitor(string name, UnityEngine.Object context = null, LogChannel channel = LogChannel.None)
+    public static PerfMonitor Monitor(string name,float aggregateSeconds = 0f, Action aggregateSecondsCallback=null, LogChannel channel = LogChannel.None,bool profile = true, float warnTimeThresholdMs = 0f, UnityEngine.Object context = null )
     {
+
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-        // 优化：如果频道没开启，直接返回 dummy，不创建 Monitor 对象，不记录 GC/Time
-        if (!IsChannelEnabled(channel)) return dummyScope;
-        return new ScopeMonitor(name, context, channel);
+        if (aggregateSecondsCallback != null)
+        {
+            StatsCacheAction.TryAdd(name, aggregateSecondsCallback);
+        }
+#if  !UNITY_EDITOR
+        profile = false; 
+#endif
+        return new PerfMonitor(name, context, channel, aggregateSeconds, warnTimeThresholdMs,profile);
 #else
-        return dummyScope;
+        return default; 
 #endif
     }
-
     [HideInCallstack]
-    public static IDisposable Monitor(this object mClass, string name, UnityEngine.Object context = null, LogChannel channel = LogChannel.None)
+    public static PerfMonitor Monitor(this object mClass,string name,float aggregateSeconds = 0f, Action aggregateSecondsCallback=null,   LogChannel channel = LogChannel.None, bool profile = true,float warnTimeThresholdMs = 0f,UnityEngine.Object context = null )
     {
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-        if (!IsChannelEnabled(channel)) return dummyScope;
-        name = $"[{mClass.GetType().Name}] {name}";
-        // 修复：补上了 channel 参数，之前这里编译会报错
-        return new ScopeMonitor(name, context, channel);
+        if (aggregateSecondsCallback != null)
+        {
+            StatsCacheAction.TryAdd(name, aggregateSecondsCallback);
+        }
+
+        name += $" [T:{mClass.GetType()}] ";
+        return new PerfMonitor(name, context, channel, aggregateSeconds, warnTimeThresholdMs,profile);
 #else
-        return dummyScope;
+        return default; 
 #endif
     }
+ 
 
-    private sealed class DummyScope : IDisposable
+    // --- 聚合数据缓存类 ---
+    private class MonitorStat
     {
-        public void Dispose() { }
+        public int Count;
+        public double TotalTimeMs;
+        public double MaxTimeMs;
+        public long TotalAlloc;
+        public long MaxAlloc;
+        public float NextLogTime;
+        
+        public void Reset(float nextTime)
+        {
+            Count = 0;
+            TotalTimeMs = 0;
+            MaxTimeMs = 0;
+            TotalAlloc = 0;
+            MaxAlloc = 0;
+            NextLogTime = nextTime;
+        }
     }
+
+    // 使用字典缓存每个 Name 的统计数据
+    private static readonly Dictionary<string, MonitorStat> StatsCache = new Dictionary<string, MonitorStat>();
+    private static readonly Dictionary<string, Action> StatsCacheAction = new Dictionary<string, Action>();
     
-    private static readonly IDisposable dummyScope = new DummyScope();
-
-    private sealed class ScopeMonitor : IDisposable
+public readonly struct PerfMonitor : IDisposable
     {
         private readonly string _name;
         private readonly UnityEngine.Object _context;
         private readonly long _startTime;
         private readonly long _startGC;
         private readonly LogChannel _logChannel;
+        private readonly float _aggregateSeconds;
+        private readonly float _warnTimeThresholdMs;
+        private readonly bool _isActive;
+        private readonly bool profile;
 
-        public ScopeMonitor(string name, UnityEngine.Object context, LogChannel logChannel)
+        public PerfMonitor(string name, UnityEngine.Object context, LogChannel logChannel, float aggregateSeconds, float warnTimeThresholdMs, bool profile)
         {
+            _isActive = IsChannelEnabled(logChannel);
+            if (!_isActive)
+            {
+                this = default;
+                return;
+            }
+        
             _name = name;
             _context = context;
             _logChannel = logChannel;
+            _aggregateSeconds = aggregateSeconds;
+            _warnTimeThresholdMs = warnTimeThresholdMs;
+            this.profile = profile;
+            
+    
             _startGC = GC.GetTotalMemory(false);
+            if(profile)
+                Profiler.BeginSample(name);
+                
             _startTime = Stopwatch.GetTimestamp();
         }
 
         public void Dispose()
         {
-       
-            if (!IsChannelEnabled(_logChannel)) return;
+            if (!_isActive) return;
             
             long endTime = Stopwatch.GetTimestamp();
-            long endGC = GC.GetTotalMemory(false);
-
+            if(profile)
+                Profiler.EndSample();
+                
+          
+            long endGC =  GC.GetTotalMemory(false);
+            
             double ms = (endTime - _startTime) * 1000.0 / Stopwatch.Frequency;
-            string timeLog = ms < 1.0 ? $"{ms:F4} ms" : $"{ms:F2} ms";
-
             long diff = endGC - _startGC;
-            string gcLog;
-            bool hasAlert = false;
-
-            if (diff > 0)
+          
+            long alloc = diff > 0 ? diff : 0;
+   
+            if (_aggregateSeconds > 0.00001f)
             {
-                gcLog = $"Alloc: +{diff} B";
-                hasAlert = true;
-            }
-            else if (diff < 0)
-            {
-                gcLog = "GC Triggered";
-                hasAlert = true;
+                // ========== 聚合统计模式 ==========
+                ProcessAggregate(ms, alloc);
             }
             else
             {
-                gcLog = "No Alloc";
+                // ========== 立即打印模式 ==========
+                ProcessImmediate(ms, diff);
+            }
+        }
+
+        private void ProcessAggregate(double ms, long alloc)
+        {
+            if (!StatsCache.TryGetValue(_name, out var stat))
+            {
+             
+                stat = new MonitorStat { NextLogTime = GetRealtimeSeconds() + _aggregateSeconds };
+                StatsCache[_name] = stat;
             }
 
+            stat.Count++;
+            stat.TotalTimeMs += ms;
+            if (ms > stat.MaxTimeMs) stat.MaxTimeMs = ms;
+
+            stat.TotalAlloc += alloc;
+            if (alloc > stat.MaxAlloc) stat.MaxAlloc = alloc;
+
+            if (GetRealtimeSeconds() >= stat.NextLogTime)
+            {
+                double avgTime = stat.TotalTimeMs / stat.Count;
+                long avgAlloc = stat.TotalAlloc / stat.Count;
+
+                string timeStr = $"Time (Avg: {avgTime:F3}ms | Max: {stat.MaxTimeMs:F3}ms)";
+                string gcStr = stat.MaxAlloc > 0 
+                    ? $"Alloc (Avg: {avgAlloc}B | Max: {stat.MaxAlloc}B)" 
+                    : "No Alloc";
+                string callCountStr = $"Calls: {stat.Count}";
+
+                string finalLog = $"[Monitor-Agg] {_name} -> {timeStr} | {gcStr} | {callCountStr}";
+                Color logColor = stat.MaxAlloc > 0 ? DefaultMonitorGCColor : DefaultMonitorNoGCColor; 
+                
+                Log_Internal(finalLog, logColor, LogLevel.Info, _context, _logChannel);
+
+                stat.Reset(GetRealtimeSeconds() + _aggregateSeconds);
+                if (StatsCacheAction.TryGetValue(_name, out var action))
+                {
+                    action?.Invoke();
+                }
+            }
+        }
+
+        private void ProcessImmediate(double ms, long diff)
+        {
+            bool hasAlert = diff > 0 || diff < 0; 
+            bool isOverTime = ms > _warnTimeThresholdMs;
+            
+            if (!hasAlert && !isOverTime) return; 
+       
+            string timeLog = ms < 1.0 ? $"{ms:F4} ms" : $"{ms:F2} ms";
+            string gcLog;
+            if (diff is >= 1024 and < 1024 * 1024)
+            {
+                gcLog = $"Alloc: +{diff/1204f:F2} KB";
+            }
+            else if(diff >= 1024 * 1024)
+            {
+                gcLog = $"Alloc: +{diff/(1024f*1024f):F2} MB";
+            }
+            else if (diff > 0)
+            {
+                gcLog = $"Alloc: +{diff} B";
+            }
+            else if (diff < 0) gcLog = "GC Triggered";
+            else gcLog = "No Alloc";
+        
             var finalLog = $"[Monitor] {_name} -> Time: {timeLog} | {gcLog}";
             Color logColor = hasAlert ? DefaultMonitorGCColor : DefaultMonitorNoGCColor;
 
-            Log_Internal(finalLog, logColor, LogLevel.Info, _context, _logChannel);
+            Log_Internal(finalLog, logColor,  LogLevel.Info, _context, _logChannel);
+        }
+
+        // 辅助方法：获取不受 Unity 主线程限制的时间
+        private static float GetRealtimeSeconds()
+        {
+            return (float)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
         }
     }
 
     #endregion
+    #endregion
+
+}
+
+
+public static class ReleaseLogTools
+{
+    private static readonly string LogDir = Path.Combine(Application.persistentDataPath, "ReleaseLogs");
+    private static readonly string LogFile = Path.Combine(LogDir, $"release_{DateTime.Now:yyyy-MM-dd}.log");
+
+    private static readonly Queue<string> _queue = new Queue<string>();
+    private static readonly object Locker = new object();
+    private static AutoResetEvent _signal = new AutoResetEvent(false);
+    private static bool _running = true;
+
+    private static readonly Stack<StringBuilder> _sbPool = new Stack<StringBuilder>();
+
+    // 默认颜色
+    private static readonly Color InfoColor = Color.white;
+    private static readonly Color WarnColor = Color.yellow;
+    private static readonly Color ErrorColor = Color.red;
+
+    static ReleaseLogTools()
+    {
+        if (!Directory.Exists(LogDir))
+            Directory.CreateDirectory(LogDir);
+
+        Task.Run(() => BackgroundWriter());
+
+        Application.quitting += () =>
+        {
+            _running = false;
+            _signal.Set();
+        };
+    }
+
+    #region Public API
+
+    public static void LogException(string msg, Exception ex)
+    {
+        msg = $"{msg}\n{ex.Message}\n{ex.StackTrace}";
+        EnqueueLine(msg, LogLevel.Error, null);
+    }
+
+    public static void Log(string msg)
+    {
+        EnqueueLine(msg, LogLevel.Info, null);
+    }
+
+    public static void LogWarning(string msg)
+    {
+        EnqueueLine(msg, LogLevel.Warn, null);
+    }
+
+    public static void LogError(string msg)
+    {
+        EnqueueLine(msg, LogLevel.Error, null);
+    }
+
+    public static void LogRelease(this object obj, string msg, LogLevel level = LogLevel.Info)
+    {
+        EnqueueLine($"[{obj.GetType().Name}] {msg}", level, null);
+    }
+
+    public static void LogRelease(this object obj, object msg, LogLevel level = LogLevel.Info)
+    {
+        string serialized = SerializeObject(msg);
+        EnqueueLine($"[{obj.GetType().Name}] {serialized}", level, null);
+    }
+
+    #endregion
+
+    #region 内部方法
+
+    private static void EnqueueLine(string line, LogLevel level, Color? color)
+    {
+        if (level == LogLevel.Error)
+        {
+            string stack = Environment.StackTrace;
+            line += "\n" + stack;
+        }
+
+
+        Color finalColor = color ?? GetDefaultColor(level);
+
+        string finalLine = $"[{level}] [{DateTimeOffset.Now}] {line}";
+      
+        lock (Locker)
+        {
+            _queue.Enqueue(finalLine);
+        }
+        
+#if UNITY_EDITOR
+        string colorTag = $"<color=#{ColorUtility.ToHtmlStringRGB(finalColor)}>";
+        finalLine = $"{colorTag}[{level}] [{DateTimeOffset.Now}] {line}</color>";
+        switch (level)
+        {
+            case LogLevel.Info: Debug.Log(finalLine); break;
+            case LogLevel.Warn: Debug.LogWarning(finalLine); break;
+            case LogLevel.Error: Debug.LogError(finalLine); break;
+        }
+#endif
+
+        _signal.Set();
+    }
+
+    private static Color GetDefaultColor(LogLevel level)
+    {
+        return level switch
+        {
+            LogLevel.Info => InfoColor,
+            LogLevel.Warn => WarnColor,
+            LogLevel.Error => ErrorColor,
+            _ => InfoColor
+        };
+    }
+
+    private static void BackgroundWriter()
+    {
+        while (_running)
+        {
+            _signal.WaitOne();
+            List<string> batch = new List<string>();
+
+            lock (Locker)
+            {
+                while (_queue.Count > 0)
+                    batch.Add(_queue.Dequeue());
+            }
+
+            if (batch.Count > 0)
+            {
+                try
+                {
+                    File.AppendAllLines(LogFile, batch, Encoding.UTF8);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"ReleaseLogTools write error: {e}");
+                }
+            }
+        }
+
+        // 退出前 flush
+        List<string> finalBatch = new List<string>();
+        lock (Locker)
+        {
+            while (_queue.Count > 0)
+                finalBatch.Add(_queue.Dequeue());
+        }
+
+        if (finalBatch.Count > 0)
+        {
+            try
+            {
+                File.AppendAllLines(LogFile, finalBatch, Encoding.UTF8);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static string SerializeObject(object obj)
+    {
+        if (obj == null) return "null";
+        if (obj is string || obj.GetType().IsPrimitive) return obj.ToString();
+
+        var sb = GetSB();
+        try
+        {
+            SerializeInternal(sb, obj, 0);
+            return sb.ToString();
+        }
+        finally
+        {
+            ReleaseSB(sb);
+        }
+    }
+
+    private static void SerializeInternal(StringBuilder sb, object obj, int depth)
+    {
+        if (depth > 5)
+        {
+            sb.Append("...");
+            return;
+        }
+
+        if (obj is IDictionary dict)
+        {
+            sb.Append("{");
+            bool first = true;
+            foreach (DictionaryEntry entry in dict)
+            {
+                if (!first) sb.Append(", ");
+                SerializeInternal(sb, entry.Key, depth + 1);
+                sb.Append(": ");
+                SerializeInternal(sb, entry.Value, depth + 1);
+                first = false;
+            }
+
+            sb.Append("}");
+        }
+        else if (obj is IEnumerable enumerable && !(obj is string))
+        {
+            sb.Append("[");
+            bool first = true;
+            foreach (var item in enumerable)
+            {
+                if (!first) sb.Append(", ");
+                SerializeInternal(sb, item, depth + 1);
+                first = false;
+            }
+
+            sb.Append("]");
+        }
+        else
+        {
+            sb.Append(obj.ToString());
+        }
+    }
+
+    #endregion
+
+    #region StringBuilder Pool
+
+    private static StringBuilder GetSB()
+    {
+        lock (_sbPool)
+        {
+            if (_sbPool.Count > 0)
+            {
+                var sb = _sbPool.Pop();
+                sb.Clear();
+                return sb;
+            }
+        }
+
+        return new StringBuilder(512);
+    }
+
+    private static void ReleaseSB(StringBuilder sb)
+    {
+        lock (_sbPool)
+        {
+            _sbPool.Push(sb);
+        }
+    }
 
     #endregion
 }
